@@ -1,0 +1,24 @@
+providers:
+  - name: my-azure-provider
+    type: AZURE
+    token: <TOKEN>
+    baseUrl: <BASE_URL>
+    model: gpt-4o-mini
+    version: 2025-01-01-preview
+
+servers:
+  - name: my-mcp-server
+    # type: local
+    # command: 
+    #   - /repo/my-mcp-server/my-mcp-server
+    type: sse
+    url: ${MY_MCP_SERVER_URL|http://localhost:8080/mcp/events}
+
+agents:
+  - name: my-agent
+    servers:
+      - Name: my-mcp-server
+        AllowedTools:
+          - tool001
+          - tool002
+    provider: my-azure-provider
