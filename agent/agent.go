@@ -116,7 +116,102 @@ func (m *MCPAgent) ExecuteTool(ctx context.Context, toolName, argumentsInJSON st
 	return marshaledResult, nil
 }
 
-func (m *MCPAgent) GenerateContent(ctx context.Context, prompt string) string {
+func (m *MCPAgent) GenerateContentAsStreaming(ctx context.Context, prompt string, addNotFinalResponses bool) chan string {
+	msgs := []llms.MessageContent{
+		{Role: "human", Parts: []llms.ContentPart{llms.TextContent{Text: prompt}}},
+	}
+
+	tools := m.ExtractToolsFromAgent()
+	streamingChan := make(chan string)
+
+	go func() {
+		defer close(streamingChan)
+
+		resp, err := m.LLMModel.GenerateContent(ctx, msgs, llms.WithTools(tools), llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
+			// Check if the chunk contains tool call information
+			var chunkData map[string]interface{}
+			// First check if chunk is a tool call array
+			var toolCallArray []interface{}
+			if err := json.Unmarshal(chunk, &toolCallArray); err == nil && len(toolCallArray) > 0 {
+				// This is a tool call array, don't send to channel
+				return nil
+			}
+
+			// If not a tool call array, check if it's a regular response with tool calls
+			if err := json.Unmarshal(chunk, &chunkData); err == nil {
+				// If it's a tool call, don't send to channel
+				if choices, ok := chunkData["choices"].([]interface{}); ok && len(choices) > 0 {
+					if choice, ok := choices[0].(map[string]interface{}); ok {
+						if toolCalls, ok := choice["tool_calls"].([]interface{}); ok && len(toolCalls) > 0 {
+							return nil
+						}
+					}
+				}
+			}
+			streamingChan <- string(chunk)
+			return nil
+		}))
+		if err != nil {
+			streamingChan <- fmt.Sprintf("Error generating content: %v", err)
+			return
+		}
+
+		// Handle tool calls after streaming is complete
+		if len(resp.Choices) > 0 && len(resp.Choices[0].ToolCalls) > 0 {
+			for _, suggestedTool := range resp.Choices[0].ToolCalls {
+				if addNotFinalResponses {
+					streamingChan <- fmt.Sprintf("\n[tool_usage] %s\n", suggestedTool.FunctionCall.Name)
+				}
+
+				toolRes, err := m.ExecuteTool(ctx, suggestedTool.FunctionCall.Name, suggestedTool.FunctionCall.Arguments)
+				if err != nil {
+					streamingChan <- fmt.Sprintf("Error executing tool: %v", err)
+					return
+				}
+
+				msgs = append(msgs, llms.MessageContent{
+					Role: "ai",
+					Parts: []llms.ContentPart{
+						suggestedTool,
+					},
+				})
+
+				msgs = append(msgs, llms.MessageContent{
+					Role: "tool",
+					Parts: []llms.ContentPart{
+						llms.ToolCallResponse{
+							ToolCallID: suggestedTool.ID,
+							Content:    toolRes,
+						},
+					},
+				})
+
+				if addNotFinalResponses {
+					msgToPrint := toolRes
+					if len(msgToPrint) > 1000 {
+						msgToPrint = msgToPrint[:1000] + "..."
+					}
+					streamingChan <- fmt.Sprintf("\n[tool_response] %s: %s]\n\n", suggestedTool.FunctionCall.Name, msgToPrint)
+				}
+			}
+
+			// Generate final response with tool results
+			finalResp, err := m.LLMModel.GenerateContent(ctx, msgs, llms.WithTools(tools), llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
+				streamingChan <- string(chunk)
+				return nil
+			}))
+			if err != nil {
+				streamingChan <- fmt.Sprintf("Error generating final content: %v", err)
+				return
+			}
+			_ = finalResp
+		}
+	}()
+
+	return streamingChan
+}
+
+func (m *MCPAgent) GenerateContent(ctx context.Context, prompt string, addNotFinalResponses bool) string {
 	msgs := []llms.MessageContent{
 		{Role: "human", Parts: []llms.ContentPart{llms.TextContent{Text: prompt}}},
 	}
@@ -133,7 +228,9 @@ func (m *MCPAgent) GenerateContent(ctx context.Context, prompt string) string {
 
 	if len(toolCalls) > 0 {
 		for _, suggestedTool := range toolCalls {
-			fmt.Printf("Suggested to use tool %s\n", suggestedTool.FunctionCall.Name)
+			if addNotFinalResponses {
+				response += fmt.Sprintf("\n[tool_usage] %s\n", suggestedTool.FunctionCall.Name)
+			}
 			toolRes, err := m.ExecuteTool(ctx, suggestedTool.FunctionCall.Name, suggestedTool.FunctionCall.Arguments)
 			if err != nil {
 				panic(err)
@@ -155,6 +252,14 @@ func (m *MCPAgent) GenerateContent(ctx context.Context, prompt string) string {
 					},
 				},
 			})
+
+			if addNotFinalResponses {
+				msgToPrint := toolRes
+				if len(msgToPrint) > 1000 {
+					msgToPrint = msgToPrint[:1000] + "..."
+				}
+				response += fmt.Sprintf("\n[tool_response] %s: %s]\n\n", suggestedTool.FunctionCall.Name, msgToPrint)
+			}
 		}
 
 		resp, err := m.LLMModel.GenerateContent(ctx, msgs, llms.WithTools(tools))
@@ -162,9 +267,9 @@ func (m *MCPAgent) GenerateContent(ctx context.Context, prompt string) string {
 			panic(err)
 		}
 
-		response = resp.Choices[0].Content
+		response += resp.Choices[0].Content
 	} else {
-		response = resp.Choices[0].Content
+		response += resp.Choices[0].Content
 	}
 
 	return response
