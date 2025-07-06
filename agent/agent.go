@@ -116,16 +116,17 @@ func (m *MCPAgent) ExecuteTool(ctx context.Context, toolName, argumentsInJSON st
 	return marshaledResult, nil
 }
 
-func (m *MCPAgent) GenerateContentAsStreaming(ctx context.Context, prompt string, addNotFinalResponses bool) chan string {
-	msgs := []llms.MessageContent{
-		{Role: "human", Parts: []llms.ContentPart{llms.TextContent{Text: prompt}}},
-	}
+func (m *MCPAgent) GenerateContentAsStreaming(ctx context.Context, msgs []llms.MessageContent, addNotFinalResponses bool) (chan string, chan llms.MessageContent) {
 
 	tools := m.ExtractToolsFromAgent()
 	streamingChan := make(chan string)
+	streamingMsgsChain := make(chan llms.MessageContent)
+
+	finalAnswer := ""
 
 	go func() {
 		defer close(streamingChan)
+		defer close(streamingMsgsChain)
 
 		resp, err := m.LLMModel.GenerateContent(ctx, msgs, llms.WithTools(tools), llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
 			// Check if the chunk contains tool call information
@@ -149,6 +150,7 @@ func (m *MCPAgent) GenerateContentAsStreaming(ctx context.Context, prompt string
 				}
 			}
 			streamingChan <- string(chunk)
+			finalAnswer += string(chunk)
 			return nil
 		}))
 		if err != nil {
@@ -169,22 +171,28 @@ func (m *MCPAgent) GenerateContentAsStreaming(ctx context.Context, prompt string
 					return
 				}
 
-				msgs = append(msgs, llms.MessageContent{
-					Role: "ai",
+				suggestedToolMsg := llms.MessageContent{
+					Role: llms.ChatMessageTypeAI,
 					Parts: []llms.ContentPart{
 						suggestedTool,
 					},
-				})
+				}
 
-				msgs = append(msgs, llms.MessageContent{
-					Role: "tool",
+				msgs = append(msgs, suggestedToolMsg)
+				streamingMsgsChain <- suggestedToolMsg
+
+				toolCallResponseMsg := llms.MessageContent{
+					Role: llms.ChatMessageTypeTool,
 					Parts: []llms.ContentPart{
 						llms.ToolCallResponse{
 							ToolCallID: suggestedTool.ID,
 							Content:    toolRes,
 						},
 					},
-				})
+				}
+
+				msgs = append(msgs, toolCallResponseMsg)
+				streamingMsgsChain <- toolCallResponseMsg
 
 				if addNotFinalResponses {
 					msgToPrint := toolRes
@@ -196,25 +204,29 @@ func (m *MCPAgent) GenerateContentAsStreaming(ctx context.Context, prompt string
 			}
 
 			// Generate final response with tool results
-			finalResp, err := m.LLMModel.GenerateContent(ctx, msgs, llms.WithTools(tools), llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
+			_, err := m.LLMModel.GenerateContent(ctx, msgs, llms.WithTools(tools), llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
 				streamingChan <- string(chunk)
+				finalAnswer += string(chunk)
 				return nil
 			}))
 			if err != nil {
 				streamingChan <- fmt.Sprintf("Error generating final content: %v", err)
 				return
 			}
-			_ = finalResp
+		}
+
+		streamingMsgsChain <- llms.MessageContent{
+			Role:  llms.ChatMessageTypeAI,
+			Parts: []llms.ContentPart{llms.TextContent{Text: finalAnswer}},
 		}
 	}()
 
-	return streamingChan
+	return streamingChan, streamingMsgsChain
 }
 
-func (m *MCPAgent) GenerateContent(ctx context.Context, prompt string, addNotFinalResponses bool) string {
-	msgs := []llms.MessageContent{
-		{Role: "human", Parts: []llms.ContentPart{llms.TextContent{Text: prompt}}},
-	}
+func (m *MCPAgent) GenerateContent(ctx context.Context, msgs []llms.MessageContent, addNotFinalResponses bool) (string, []llms.MessageContent) {
+	msgsContext := make([]llms.MessageContent, len(msgs))
+	copy(msgsContext, msgs)
 
 	tools := m.ExtractToolsFromAgent()
 	resp, err := m.LLMModel.GenerateContent(ctx, msgs, llms.WithTools(tools))
@@ -236,22 +248,26 @@ func (m *MCPAgent) GenerateContent(ctx context.Context, prompt string, addNotFin
 				panic(err)
 			}
 
-			msgs = append(msgs, llms.MessageContent{
-				Role: "ai",
+			suggestedToolMsg := llms.MessageContent{
+				Role: llms.ChatMessageTypeAI,
 				Parts: []llms.ContentPart{
 					suggestedTool,
 				},
-			})
+			}
 
-			msgs = append(msgs, llms.MessageContent{
-				Role: "tool",
+			msgs = append(msgs, suggestedToolMsg)
+
+			toolCallResponseMsg := llms.MessageContent{
+				Role: llms.ChatMessageTypeTool,
 				Parts: []llms.ContentPart{
 					llms.ToolCallResponse{
 						ToolCallID: suggestedTool.ID,
 						Content:    toolRes,
 					},
 				},
-			})
+			}
+
+			msgs = append(msgs, toolCallResponseMsg)
 
 			if addNotFinalResponses {
 				msgToPrint := toolRes
@@ -267,12 +283,22 @@ func (m *MCPAgent) GenerateContent(ctx context.Context, prompt string, addNotFin
 			panic(err)
 		}
 
+		msgsContext = append(msgsContext, llms.MessageContent{
+			Role:  llms.ChatMessageTypeAI,
+			Parts: []llms.ContentPart{llms.TextContent{Text: resp.Choices[0].Content}},
+		})
+
 		response += resp.Choices[0].Content
 	} else {
+		msgsContext = append(msgsContext, llms.MessageContent{
+			Role:  llms.ChatMessageTypeAI,
+			Parts: []llms.ContentPart{llms.TextContent{Text: resp.Choices[0].Content}},
+		})
+
 		response += resp.Choices[0].Content
 	}
 
-	return response
+	return response, msgsContext
 }
 
 func (m *MCPAgent) ExtractToolsFromAgent() []llms.Tool {
